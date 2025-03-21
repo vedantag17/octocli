@@ -287,6 +287,48 @@ class GitHubAnalyzer:
         except Exception as e:
             return f"Error querying LLM: {str(e)}"
 
+class CodebaseFetcher:
+    def __init__(self, token: Optional[str] = None):
+        self.github = Github(token)
+        self.current_repo = None
+
+    def init_repository(self, repo_url: str):
+        parts = repo_url.rstrip('/').split('/')
+        repo_name = f"{parts[-2]}/{parts[-1]}"
+        self.current_repo = self.github.get_repo(repo_name)
+        return self.current_repo
+
+    def fetch_codebase(self, repo_url: str) -> List[Dict]:
+        """Fetch the entire codebase excluding JSON and Markdown files."""
+        self.init_repository(repo_url)
+        contents = self.current_repo.get_contents("")
+        code_files = []
+
+        with console.status("[bold green]Fetching codebase...") as status:
+            while contents:
+                file_content = contents.pop(0)
+                if file_content.type == "dir":
+                    try:
+                        dir_contents = self.current_repo.get_contents(file_content.path)
+                        contents.extend(dir_contents)
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Could not read directory {file_content.path}: {str(e)}[/yellow]")
+                        continue
+                else:
+                    # Exclude JSON and Markdown files
+                    if not (file_content.path.endswith('.json') or file_content.path.endswith('.md')):
+                        try:
+                            code_files.append({
+                                "path": file_content.path,
+                                "content": file_content.decoded_content.decode('utf-8') if file_content.content else None
+                            })
+                            console.print(f"Fetched: {file_content.path}")
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Could not fetch {file_content.path}: {str(e)}[/yellow]")
+                            continue
+
+        return code_files
+
 @app.command()
 def config(
     github_token: str = typer.Option(None, "--github-token", help="GitHub API token"),
@@ -590,6 +632,39 @@ def issue(
 
     except Exception as e:
         console.print(f"[bold red]Error: {str(e)}[/bold red]")
+        raise typer.Exit(1)
+
+@app.command()
+def fetch_codebase(
+    repo_url: str = typer.Argument(..., help="GitHub repository URL"),
+):
+    """Fetch the entire codebase excluding JSON and Markdown files."""
+    config = Config()
+    github_token = config.get('github_token')
+    
+    if not github_token:
+        console.print("[red]GitHub token not found. Use 'octo config --github-token YOUR_TOKEN'[/red]")
+        raise typer.Exit(1)
+
+    fetcher = CodebaseFetcher(github_token)
+    
+    try:
+        code_files = fetcher.fetch_codebase(repo_url)
+        
+        # Save the fetched code files to a local directory
+        output_dir = "fetched_codebase"
+        os.makedirs(output_dir, exist_ok=True)
+
+        for file in code_files:
+            file_path = os.path.join(output_dir, file['path'])
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)  # Create directories if needed
+            with open(file_path, "w", encoding='utf-8') as f:
+                f.write(file['content'])
+        
+        console.print(f"[bold green]Codebase fetched successfully! Files saved in '{output_dir}'[/bold green]")
+    
+    except Exception as e:
+        console.print(f"[bold red]Error fetching codebase: {str(e)}[/bold red]")
         raise typer.Exit(1)
 
 if __name__ == "__main__":
