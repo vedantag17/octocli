@@ -22,6 +22,12 @@ import shutil
 from dotenv import load_dotenv
 import re
 from octocli.services.analyzer_service import AnalyzerService
+from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich.panel import Panel
+from rich import box
+from rich.table import Table
+from rich.console import Group
 
 app = typer.Typer()
 console = Console()
@@ -595,7 +601,245 @@ class CodebaseFetcher:
         # Return top N file paths
         return [file_path for file_path, _ in sorted_files[:top_n]]
 
-@app.command()
+def format_llm_response(text: str):
+    """Format an LLM response with rich syntax highlighting and markdown rendering"""
+    from rich.markdown import Markdown
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+    from rich import box
+    from rich.table import Table
+    from rich.console import Group
+    
+    # Extract code blocks for syntax highlighting
+    parts = []
+    code_block_pattern = re.compile(r'```([\w+-]*)[\s\n](.*?)```', re.DOTALL)
+    
+    # Find all code blocks and their languages
+    last_end = 0
+    for match in code_block_pattern.finditer(text):
+        # Add text before this code block
+        if match.start() > last_end:
+            md_text = text[last_end:match.start()]
+            if md_text.strip():
+                parts.append(("markdown", md_text))
+        
+        # Extract language and code
+        lang = match.group(1).strip() or "text"
+        code = match.group(2).strip()
+        
+        # Add the code block with appropriate syntax highlighting
+        parts.append(("code", (lang, code)))
+        last_end = match.end()
+    
+    # Add any text after the last code block
+    if last_end < len(text):
+        remaining_text = text[last_end:]
+        if remaining_text.strip():
+            parts.append(("markdown", remaining_text))
+    
+    # If no code blocks were found, treat the entire text as markdown
+    if not parts:
+        parts.append(("markdown", text))
+    
+    # Create a header panel with subtle styling
+    header = Panel(
+        "[bold white]Answer[/bold white]",
+        box=box.ROUNDED,
+        style="green",
+        padding=(1, 2)
+    )
+    console.print(header)
+    
+    # Print each part with appropriate formatting
+    for i, (part_type, content) in enumerate(parts):
+        if part_type == "markdown":
+            # Check for tables in markdown and handle specially
+            if "| ---" in content or "|---" in content:
+                # This might be a markdown table
+                table_sections = []
+                in_table = False
+                current_text = ""
+                
+                for line in content.split("\n"):
+                    if line.strip().startswith("|") and "|" in line[1:]:
+                        if not in_table:
+                            # Start of a table - print accumulated text
+                            if current_text.strip():
+                                console.print(Markdown(current_text))
+                                current_text = ""
+                            in_table = True
+                        table_sections.append(line)
+                    else:
+                        if in_table:
+                            # End of a table - create and print the table
+                            try:
+                                # Try to create a Rich table from markdown
+                                md_table = "\n".join(table_sections)
+                                console.print(Markdown(md_table))
+                            except Exception:
+                                # Fall back to plain text for table
+                                for table_line in table_sections:
+                                    console.print(table_line)
+                            table_sections = []
+                            in_table = False
+                        current_text += line + "\n"
+                
+                # Print any remaining text
+                if current_text.strip():
+                    console.print(Markdown(current_text))
+                
+                # Print any dangling table
+                if table_sections:
+                    md_table = "\n".join(table_sections)
+                    console.print(Markdown(md_table))
+            else:
+                # Convert plain text sections to markdown
+                try:
+                    md = Markdown(content)
+                    console.print(md)
+                except Exception:
+                    # Fallback if markdown parsing fails
+                    console.print(content)
+        else:
+            # Render code blocks with syntax highlighting
+            lang, code = content
+            
+            # Clean up the language name
+            lang = lang.lower().strip()
+            if lang in ["js", "javascript"]:
+                lang = "javascript"
+            elif lang in ["py", "python"]:
+                lang = "python"
+            elif lang in ["ts", "typescript"]:
+                lang = "typescript"
+            elif lang in ["sh", "bash", "shell"]:
+                lang = "bash"
+            
+            try:
+                # Try to use the specified language with improved styling
+                syntax = Syntax(
+                    code,
+                    lang,
+                    theme="monokai",
+                    line_numbers=True,
+                    word_wrap=True,
+                    indent_guides=True,
+                    padding=(1, 2)
+                )
+                console.print(Panel(
+                    syntax,
+                    border_style="dim",
+                    box=box.SIMPLE,
+                    title=f"[bold]{lang}[/bold]" if lang != "text" else None,
+                    title_align="left"
+                ))
+            except Exception:
+                # Fallback to plain text if language is not supported
+                console.print(Panel(
+                    code,
+                    border_style="dim",
+                    box=box.SIMPLE,
+                    title="[bold]code[/bold]",
+                    title_align="left",
+                    padding=(1, 2)
+                ))
+        
+        # Add spacing between sections (but not too much)
+        if i < len(parts) - 1:
+            console.print("")
+
+@app.command(rich_help_panel="1️⃣ Getting Started")
+def init(
+    repo_url: str = typer.Argument(..., help="GitHub repository URL or local repository path"),
+    analyze_repo: bool = typer.Option(False, "--analyze", help="Run analysis after initialization"),
+    fetch_code: bool = typer.Option(False, "--fetch", help="Fetch codebase after initialization"),
+    setup_model: bool = typer.Option(False, "--setup-model", help="Run model setup after initialization")
+):
+    """Initialize OctoCLI with a GitHub repository or local repository"""
+    config = Config()
+    
+    # Check if the provided input is a local path or a URL
+    if os.path.exists(repo_url) and os.path.isdir(repo_url):
+        # Handle local repository
+        console.print(f"[bold blue]Initializing OctoCLI with local repository: {repo_url}[/bold blue]")
+        
+        # Convert to absolute path if relative
+        if not os.path.isabs(repo_url):
+            repo_url = os.path.abspath(repo_url)
+            
+        # Save the local path in config
+        config.set('current_repo', repo_url)
+        config.set('is_local_repo', 'true')
+        
+        console.print(f"[green]Successfully initialized OctoCLI with local repository at: {repo_url}[/green]")
+        
+        # Run analysis if requested
+        if analyze_repo:
+            console.print("[bold]Running initial analysis...[/bold]")
+            analyze(local_path=repo_url)
+    else:
+        # Handle GitHub repository
+        if not repo_url.startswith(("http://", "https://")):
+            # If it looks like org/repo format, assume GitHub
+            if '/' in repo_url and not repo_url.startswith("git@"):
+                parts = repo_url.split('/')
+                if len(parts) == 2:
+                    repo_url = f"https://github.com/{repo_url}"
+                    console.print(f"[yellow]Assuming GitHub repository: {repo_url}[/yellow]")
+            else:
+                console.print("[red]Invalid repository URL format. Use 'https://github.com/user/repo' format or a valid local path.[/red]")
+                raise typer.Exit(1)
+        
+        console.print(f"[bold blue]Initializing OctoCLI with GitHub repository: {repo_url}[/bold blue]")
+        
+        # Check GitHub token
+        github_token = config.get('github_token')
+        if not github_token:
+            console.print("[yellow]GitHub token not found. Some features may not work properly.[/yellow]")
+            console.print("[yellow]Use 'octo config --github-token YOUR_TOKEN' to set your GitHub token.[/yellow]")
+        
+        # Save the repository URL in config
+        config.set('current_repo', repo_url)
+        config.set('is_local_repo', 'false')
+        
+        console.print(f"[green]Successfully initialized OctoCLI with GitHub repository: {repo_url}[/green]")
+        
+        # Fetch codebase if requested
+        if fetch_code:
+            console.print("[bold]Fetching codebase...[/bold]")
+            fetch_codebase(repo_url)
+        
+        # Run analysis if requested
+        if analyze_repo:
+            console.print("[bold]Running initial analysis...[/bold]")
+            analyze(repo_url=repo_url)
+    
+    # Run model setup if requested
+    if setup_model:
+        if not config.get('llm_type') or not config.get('llm_key'):
+            console.print("[bold]Setting up LLM model...[/bold]")
+            setup_model()
+        else:
+            console.print("[green]LLM model already configured.[/green]")
+            console.print(f"Current LLM: {config.get('llm_type')}")
+            console.print("Use 'octo setup_model' to change the configuration.")
+    
+    # Show configuration status
+    console.print("\n[bold]OctoCLI is now ready to use![/bold]")
+    console.print(f"Repository: {repo_url}")
+    console.print(f"GitHub token: {'Configured' if config.get('github_token') else 'Not configured'}")
+    console.print(f"LLM model: {config.get('llm_type') or 'Not configured'}")
+    
+    # Show usage tips
+    console.print("\n[bold]Quick start:[/bold]")
+    console.print("- octo analyze - Run detailed analysis")
+    console.print("- octo tell \"How does this codebase work?\" - Ask questions about the code")
+    console.print("- octo list-issues - List repository issues")
+    console.print("- octo issue <number> - Analyze a specific issue")
+    
+    return {"status": "success", "repo": repo_url}
+
+@app.command(rich_help_panel="1️⃣ Getting Started")
 def config(
     github_token: str = typer.Option(None, "--github-token", help="GitHub API token"),
     llm_type: str = typer.Option(None, "--llm-type", help="LLM type (openai/anthropic)"),
@@ -631,7 +875,126 @@ def config(
     console.print(f"LLM Key: {'*' * 8 if config.get('llm_key') else 'Not set'}")
     console.print(f"Default Repository: {config.get('current_repo') or 'Not set'}")
 
-@app.command()
+@app.command(rich_help_panel="1️⃣ Getting Started")
+def setup_model():
+    """Interactive setup for choosing and configuring an LLM model"""
+    config = Config()
+    
+    # Present expanded model options
+    console.print("[bold]Available LLM Models:[/bold]")
+    console.print("1. OpenAI (GPT-4)")
+    console.print("2. Azure OpenAI (Deployed Models)")
+    console.print("3. Anthropic (Claude)")
+    console.print("4. Google (Gemini)")
+    console.print("5. Cohere (Command)")
+    console.print("6. Mistral AI")
+    console.print("7. Meta (Llama)")
+    
+    # Get user choice
+    valid_choices = ["1", "2", "3", "4", "5", "6", "7"]
+    choice = ""
+    while choice not in valid_choices:
+        choice = typer.prompt(f"Select a model (1-{len(valid_choices)})")
+        if choice not in valid_choices:
+            console.print(f"[red]Invalid choice. Please select a number between 1 and {len(valid_choices)}.[/red]")
+    
+    # Set model type based on choice
+    model_types = {
+        "1": "openai",
+        "2": "azure",
+        "3": "anthropic",
+        "4": "gemini",
+        "5": "cohere",
+        "6": "mistral",
+        "7": "llama"
+    }
+    
+    model_names = {
+        "1": "OpenAI (GPT-4)",
+        "2": "Azure OpenAI",
+        "3": "Anthropic (Claude)",
+        "4": "Google (Gemini)",
+        "5": "Cohere (Command)",
+        "6": "Mistral AI",
+        "7": "Meta (Llama)"
+    }
+    
+    model_packages = {
+        "1": "openai",
+        "2": "openai",
+        "3": "anthropic",
+        "4": "google-generativeai",
+        "5": "cohere",
+        "6": "mistralai",
+        "7": "requests (already installed)"
+    }
+    
+    model_type = model_types[choice]
+    console.print(f"\n[bold]Selected: {model_names[choice]}[/bold]")
+    
+    # Show package installation instructions
+    package_name = model_packages[choice]
+    console.print(f"\n[bold]Required package: {package_name}[/bold]")
+    console.print(f"If not already installed, use: pip install {package_name}")
+    
+    # For Azure, suggest python-dotenv
+    if model_type == "azure":
+        console.print(f"For Azure OpenAI, you may also want to install: pip install python-dotenv")
+    
+    # Ask for API key
+    console.print(f"\n[bold]Please enter your {model_type.upper()} API key:[/bold]")
+    api_key = typer.prompt("API Key", hide_input=True)
+    
+    # For Azure, collect additional required information
+    if model_type == "azure":
+        console.print("\n[bold]Azure OpenAI requires additional configuration:[/bold]")
+        azure_endpoint = typer.prompt("Enter your Azure OpenAI endpoint URL (e.g., https://your-resource.openai.azure.com)")
+        azure_deployment = typer.prompt("Enter your Azure OpenAI deployment name")
+        azure_api_version = typer.prompt("Enter API version (default: 2023-05-15)", default="2023-05-15")
+        
+        # Save Azure-specific configuration
+        config.set('azure_endpoint', azure_endpoint)
+        config.set('azure_deployment', azure_deployment)
+        config.set('azure_api_version', azure_api_version)
+        
+        # Set environment variables
+        os.environ["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
+        os.environ["AZURE_OPENAI_DEPLOYMENT"] = azure_deployment
+        os.environ["AZURE_OPENAI_API_VERSION"] = azure_api_version
+    
+    # Save configuration
+    config.set('llm_type', model_type)
+    config.set('llm_key', api_key)
+    
+    console.print(f"\n[bold green]✓ {model_type.upper()} configured successfully![/bold green]")
+    console.print("You can now use the model with commands like 'octo tell' and 'octo issue'")
+    
+    # Information about API key environment variables
+    env_var_name = f"{model_type.upper()}_API_KEY"
+    if model_type == "azure":
+        env_var_name = "AZURE_OPENAI_API_KEY"
+        console.print(f"\n[bold]Azure OpenAI Environment Variables:[/bold]")
+        console.print(f"- {env_var_name}: Your Azure OpenAI API key")
+        console.print(f"- AZURE_OPENAI_ENDPOINT: {config.get('azure_endpoint')}")
+        console.print(f"- AZURE_OPENAI_DEPLOYMENT: {config.get('azure_deployment')}")
+        console.print(f"- AZURE_OPENAI_API_VERSION: {config.get('azure_api_version')}")
+        
+        # Add information about .env file
+        console.print("\n[bold]Using .env files:[/bold]")
+        console.print("You can also store these values in a .env file in your project directory:")
+        console.print("""
+Example .env file:
+AZURE_OPENAI_API_KEY=your_api_key_here
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=your_deployment_name
+AZURE_OPENAI_API_VERSION=2023-05-15
+        """)
+    else:
+        console.print(f"\n[bold]API Key Environment Variable:[/bold] {env_var_name}")
+    
+    console.print("You can set these environment variables instead of storing values in the config file.")
+
+@app.command(rich_help_panel="2️⃣ Repository Analysis")
 def analyze(
     repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
     local_path: str = typer.Option(None, help="Local path to repository (for offline analysis)"),
@@ -1200,11 +1563,12 @@ def truncate_content(content: str, max_tokens: int) -> str:
     
     return "".join(result)
 
-@app.command()
+@app.command(rich_help_panel="3️⃣ LLM Interaction")
 def tell(
     question: str = typer.Argument(..., help="Question about the codebase"),
     repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
     use_fetched: bool = typer.Option(False, "--use-fetched", help="Use the fetched codebase instead of querying GitHub"),
+    raw_output: bool = typer.Option(False, "--raw", help="Display raw output without formatting")
 ):
     """Ask questions about the analyzed codebase"""
     config = Config()
@@ -1343,69 +1707,23 @@ def tell(
     analyzer = GitHubAnalyzer(config.get('github_token'))
     console.print(f"[bold blue]Analyzing your question using the {'fetched codebase' if use_fetched else 'repository analysis'}...[/bold blue]")
     response = analyzer.query_llm(context, llm_type, llm_key)
-    console.print(f"\n[bold green]Answer:[/bold green]\n{response}")
+    
+    # Format and display the LLM response with rich formatting
+    if raw_output:
+        # Display raw output if requested
+        console.print(f"\n[bold green]Answer:[/bold green]\n{response}")
+    else:
+        # Format the response with improved rendering
+        format_llm_response(response)
+    
+    return response
 
-@app.command()
-def list_issues(
-    repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
-    count: int = typer.Option(10, help="Number of issues to display"),
-    state: str = typer.Option("open", help="Issue state (open, closed, all)")
-):
-    """Display issues from the repository"""
-    config = Config()
-    
-    if not repo_url:
-        repo_url = config.get('current_repo')
-        if not repo_url:
-            console.print("[red]No repository specified. Use --repo-url URL[/red]")
-            raise typer.Exit(1)
-    
-    github_token = config.get('github_token')
-    if not github_token:
-        console.print("[red]GitHub token not found. Use 'octo config --github-token YOUR_TOKEN'[/red]")
-        raise typer.Exit(1)
-    
-    try:
-        analyzer = GitHubAnalyzer(github_token)
-        repo = analyzer.init_repository(repo_url)
-        
-        # Validate state parameter
-        if state not in ["open", "closed", "all"]:
-            console.print("[red]Invalid state. Use 'open', 'closed', or 'all'[/red]")
-            raise typer.Exit(1)
-        
-        # Get issues
-        issues = repo.get_issues(state=state)
-        
-        # Display issues
-        console.print(f"\n[bold blue]Issues for {repo.full_name} ({state})[/bold blue]\n")
-        
-        for i, issue in enumerate(issues[:count]):
-            console.print(f"[bold]#{issue.number}: {issue.title}[/bold]")
-            console.print(f"State: {issue.state}")
-            console.print(f"Created: {issue.created_at}")
-            console.print(f"Labels: {', '.join([label.name for label in issue.labels]) or 'None'}")
-            console.print(f"URL: {issue.html_url}")
-            console.print("")
-            
-            if i == count - 1:
-                break
-        
-        # Check if there are more issues
-        total_issues_count = repo.get_issues(state=state).totalCount
-        if total_issues_count > count:
-            console.print(f"Showing {count} of {total_issues_count} issues.")
-            console.print(f"To see more issues, use: octo list-issues --repo-url {repo_url} --count <number>")
-        
-    except Exception as e:
-        console.print(f"[bold red]Error: {str(e)}[/bold red]")
-        raise typer.Exit(1)
-
-@app.command()
+@app.command(rich_help_panel="4️⃣ GitHub Issues")
 def issue(
     issue_number: int = typer.Argument(..., help="Issue number to analyze"),
     repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
     use_fetched: bool = typer.Option(False, "--use-fetched", help="Use the fetched codebase instead of querying GitHub"),
+    raw_output: bool = typer.Option(False, "--raw", help="Display raw output without formatting")
 ):
     """Analyze and suggest solutions for a GitHub issue"""
     config = Config()
@@ -1473,6 +1791,10 @@ def issue(
                     except UnicodeDecodeError:
                         continue
         
+        # Determine which files are most relevant to the question
+        # For now, a simple approach - we'll include all code files
+        # In a more advanced version, we could use embeddings to find relevant files
+        
         # Build content with the most important files first
         important_extensions = ['.py', '.js', '.java', '.c', '.cpp', '.go', '.rs']
         
@@ -1518,8 +1840,12 @@ def issue(
         response = analyzer.query_llm(prompt, config.get('llm_type'), config.get('llm_key'))
         
         console.print(f"\n[bold blue]Analysis for Issue #{issue_number}[/bold blue]")
-        console.print(f"[bold]{issue_context}[/bold]\n")
-        console.print(response)
+        console.print(f"[bold]{issue_context.strip()}[/bold]\n")
+        
+        if raw_output:
+            console.print(response)
+        else:
+            format_llm_response(response)
 
     else:
         if not repo_url:
@@ -1552,7 +1878,7 @@ def issue(
             # Check if analysis exists
             if not os.path.exists(analysis_file):
                 console.print("[yellow]No analysis found. Running analysis first...[/yellow]")
-                analyze(repo_url)
+                app.commands['analyze'](repo_url=repo_url)
             
             # Read the analysis
             try:
@@ -1561,7 +1887,7 @@ def issue(
             except Exception as e:
                 console.print(f"[red]Error reading analysis file: {str(e)}[/red]")
                 console.print("[yellow]Running fresh analysis...[/yellow]")
-                analyze(repo_url)
+                app.commands['analyze'](repo_url=repo_url)
                 with open(analysis_file, "r", encoding='utf-8') as f:
                     analysis_content = f.read()
 
@@ -1593,13 +1919,73 @@ def issue(
             
             console.print(f"\n[bold blue]Analysis for Issue #{issue.number}[/bold blue]")
             console.print(f"[bold]{issue.title}[/bold]\n")
-            console.print(response)
+            
+            if raw_output:
+                console.print(response)
+            else:
+                format_llm_response(response)
 
         except Exception as e:
             console.print(f"[bold red]Error: {str(e)}[/bold red]")
             raise typer.Exit(1)
 
-@app.command()
+@app.command(rich_help_panel="4️⃣ GitHub Issues")
+def list_issues(
+    repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
+    count: int = typer.Option(10, help="Number of issues to display"),
+    state: str = typer.Option("open", help="Issue state (open, closed, all)")
+):
+    """Display issues from the repository"""
+    config = Config()
+    
+    if not repo_url:
+        repo_url = config.get('current_repo')
+        if not repo_url:
+            console.print("[red]No repository specified. Use --repo-url URL[/red]")
+            raise typer.Exit(1)
+    
+    github_token = config.get('github_token')
+    if not github_token:
+        console.print("[red]GitHub token not found. Use 'octo config --github-token YOUR_TOKEN'[/red]")
+        raise typer.Exit(1)
+    
+    try:
+        analyzer = GitHubAnalyzer(github_token)
+        repo = analyzer.init_repository(repo_url)
+        
+        # Validate state parameter
+        if state not in ["open", "closed", "all"]:
+            console.print("[red]Invalid state. Use 'open', 'closed', or 'all'[/red]")
+            raise typer.Exit(1)
+        
+        # Get issues
+        issues = repo.get_issues(state=state)
+        
+        # Display issues
+        console.print(f"\n[bold blue]Issues for {repo.full_name} ({state})[/bold blue]\n")
+        
+        for i, issue in enumerate(issues[:count]):
+            console.print(f"[bold]#{issue.number}: {issue.title}[/bold]")
+            console.print(f"State: {issue.state}")
+            console.print(f"Created: {issue.created_at}")
+            console.print(f"Labels: {', '.join([label.name for label in issue.labels]) or 'None'}")
+            console.print(f"URL: {issue.html_url}")
+            console.print("")
+            
+            if i == count - 1:
+                break
+        
+        # Check if there are more issues
+        total_issues_count = repo.get_issues(state=state).totalCount
+        if total_issues_count > count:
+            console.print(f"Showing {count} of {total_issues_count} issues.")
+            console.print(f"To see more issues, use: octo list-issues --repo-url {repo_url} --count <number>")
+        
+    except Exception as e:
+        console.print(f"[bold red]Error: {str(e)}[/bold red]")
+        raise typer.Exit(1)
+
+@app.command(rich_help_panel="2️⃣ Repository Analysis")
 def fetch_codebase(
     repo_url: str = typer.Argument(..., help="GitHub repository URL"),
 ):
@@ -1645,126 +2031,7 @@ def fetch_codebase(
         console.print(f"[bold red]Error fetching codebase: {str(e)}[/bold red]")
         raise typer.Exit(1)
 
-@app.command()
-def setup_model():
-    """Interactive setup for choosing and configuring an LLM model"""
-    config = Config()
-    
-    # Present expanded model options
-    console.print("[bold]Available LLM Models:[/bold]")
-    console.print("1. OpenAI (GPT-4)")
-    console.print("2. Azure OpenAI (Deployed Models)")
-    console.print("3. Anthropic (Claude)")
-    console.print("4. Google (Gemini)")
-    console.print("5. Cohere (Command)")
-    console.print("6. Mistral AI")
-    console.print("7. Meta (Llama)")
-    
-    # Get user choice
-    valid_choices = ["1", "2", "3", "4", "5", "6", "7"]
-    choice = ""
-    while choice not in valid_choices:
-        choice = typer.prompt(f"Select a model (1-{len(valid_choices)})")
-        if choice not in valid_choices:
-            console.print(f"[red]Invalid choice. Please select a number between 1 and {len(valid_choices)}.[/red]")
-    
-    # Set model type based on choice
-    model_types = {
-        "1": "openai",
-        "2": "azure",
-        "3": "anthropic",
-        "4": "gemini",
-        "5": "cohere",
-        "6": "mistral",
-        "7": "llama"
-    }
-    
-    model_names = {
-        "1": "OpenAI (GPT-4)",
-        "2": "Azure OpenAI",
-        "3": "Anthropic (Claude)",
-        "4": "Google (Gemini)",
-        "5": "Cohere (Command)",
-        "6": "Mistral AI",
-        "7": "Meta (Llama)"
-    }
-    
-    model_packages = {
-        "1": "openai",
-        "2": "openai",
-        "3": "anthropic",
-        "4": "google-generativeai",
-        "5": "cohere",
-        "6": "mistralai",
-        "7": "requests (already installed)"
-    }
-    
-    model_type = model_types[choice]
-    console.print(f"\n[bold]Selected: {model_names[choice]}[/bold]")
-    
-    # Show package installation instructions
-    package_name = model_packages[choice]
-    console.print(f"\n[bold]Required package: {package_name}[/bold]")
-    console.print(f"If not already installed, use: pip install {package_name}")
-    
-    # For Azure, suggest python-dotenv
-    if model_type == "azure":
-        console.print(f"For Azure OpenAI, you may also want to install: pip install python-dotenv")
-    
-    # Ask for API key
-    console.print(f"\n[bold]Please enter your {model_type.upper()} API key:[/bold]")
-    api_key = typer.prompt("API Key", hide_input=True)
-    
-    # For Azure, collect additional required information
-    if model_type == "azure":
-        console.print("\n[bold]Azure OpenAI requires additional configuration:[/bold]")
-        azure_endpoint = typer.prompt("Enter your Azure OpenAI endpoint URL (e.g., https://your-resource.openai.azure.com)")
-        azure_deployment = typer.prompt("Enter your Azure OpenAI deployment name")
-        azure_api_version = typer.prompt("Enter API version (default: 2023-05-15)", default="2023-05-15")
-        
-        # Save Azure-specific configuration
-        config.set('azure_endpoint', azure_endpoint)
-        config.set('azure_deployment', azure_deployment)
-        config.set('azure_api_version', azure_api_version)
-        
-        # Set environment variables
-        os.environ["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
-        os.environ["AZURE_OPENAI_DEPLOYMENT"] = azure_deployment
-        os.environ["AZURE_OPENAI_API_VERSION"] = azure_api_version
-    
-    # Save configuration
-    config.set('llm_type', model_type)
-    config.set('llm_key', api_key)
-    
-    console.print(f"\n[bold green]✓ {model_type.upper()} configured successfully![/bold green]")
-    console.print("You can now use the model with commands like 'octo tell' and 'octo issue'")
-    
-    # Information about API key environment variables
-    env_var_name = f"{model_type.upper()}_API_KEY"
-    if model_type == "azure":
-        env_var_name = "AZURE_OPENAI_API_KEY"
-        console.print(f"\n[bold]Azure OpenAI Environment Variables:[/bold]")
-        console.print(f"- {env_var_name}: Your Azure OpenAI API key")
-        console.print(f"- AZURE_OPENAI_ENDPOINT: {config.get('azure_endpoint')}")
-        console.print(f"- AZURE_OPENAI_DEPLOYMENT: {config.get('azure_deployment')}")
-        console.print(f"- AZURE_OPENAI_API_VERSION: {config.get('azure_api_version')}")
-        
-        # Add information about .env file
-        console.print("\n[bold]Using .env files:[/bold]")
-        console.print("You can also store these values in a .env file in your project directory:")
-        console.print("""
-Example .env file:
-AZURE_OPENAI_API_KEY=your_api_key_here
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_DEPLOYMENT=your_deployment_name
-AZURE_OPENAI_API_VERSION=2023-05-15
-        """)
-    else:
-        console.print(f"\n[bold]API Key Environment Variable:[/bold] {env_var_name}")
-    
-    console.print("You can set these environment variables instead of storing values in the config file.")
-
-@app.command()
+@app.command(rich_help_panel="2️⃣ Repository Analysis")
 def codebase_info():
     """Display information about the fetched codebase"""
     config = Config()
@@ -1815,7 +2082,7 @@ def codebase_info():
     
     return organized_codebase
 
-@app.command()
+@app.command(rich_help_panel="3️⃣ LLM Interaction")
 def list_models():
     """List available models for the configured LLM provider"""
     config = Config()
