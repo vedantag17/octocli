@@ -6,7 +6,9 @@ tree-sitter>=0.20.4
 pydantic>=2.5.2
 openai>=1.12.0
 anthropic>=0.18.1
-google-generativeai>=0.3.0
+# For Gemini API, install one of these:
+google-genai>=0.1.0  # New SDK for Gemini 2.0
+# google-generativeai>=0.3.0  # Legacy SDK (use if google-genai fails)
 cohere>=4.37
 mistralai>=0.0.9
 requests>=2.31.0

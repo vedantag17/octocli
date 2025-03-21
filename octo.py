@@ -373,10 +373,42 @@ class GitHubAnalyzer:
                 )
                 return response.content[0].text
             elif llm_type == "gemini":
-                genai.configure(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-                model = genai.GenerativeModel('gemini-pro')
-                response = model.generate_content(prompt)
-                return response.text
+                try:
+                    # Use the API key provided or from environment
+                    gemini_api_key = api_key or os.getenv("GEMINI_API_KEY") or self.config.get('llm_key')
+                    if not gemini_api_key:
+                        return "Error: Gemini API key not found. Set it with 'octo setup_model'"
+                    
+                    # Use the new Google GenAI SDK pattern shown in the example
+                    try:
+                        from google import genai
+                        
+                        # Create client with API key
+                        client = genai.Client(api_key=gemini_api_key)
+                        
+                        # Generate content using the model
+                        response = client.models.generate_content(
+                            model="gemini-2.0-flash",  # Using the recommended model
+                            contents=prompt
+                        )
+                        
+                        # Return the text directly - simpler pattern
+                        return response.text
+                        
+                    except ImportError:
+                        # Fall back to the legacy SDK if the new one isn't installed
+                        import google.generativeai as genai
+                        genai.configure(api_key=gemini_api_key)
+                        
+                        # Create the model and generate content
+                        model = genai.GenerativeModel('gemini-pro')
+                        response = model.generate_content(prompt)
+                        
+                        # Handle response from legacy SDK
+                        return response.text
+                        
+                except Exception as e:
+                    return f"Error with Gemini API: {str(e)}\n\nPlease ensure you've installed the correct package with 'pip install google-genai' and check your API key."
             elif llm_type == "cohere":
                 cohere_api_key = api_key or os.getenv("COHERE_API_KEY")
                 client = CohereClient(cohere_api_key)
@@ -923,7 +955,7 @@ def setup_model():
         "1": "openai",
         "2": "openai",
         "3": "anthropic",
-        "4": "google-generativeai",
+        "4": "google-genai",
         "5": "cohere",
         "6": "mistralai",
         "7": "requests (already installed)"
@@ -936,6 +968,19 @@ def setup_model():
     package_name = model_packages[choice]
     console.print(f"\n[bold]Required package: {package_name}[/bold]")
     console.print(f"If not already installed, use: pip install {package_name}")
+    
+    if model_type == "gemini":
+        console.print("\n[bold yellow]Important note for Gemini:[/bold yellow]")
+        console.print("Google has two packages for Gemini:")
+        console.print("1. Older package: google-generativeai")
+        console.print("2. Newer package: google-genai (recommended for Gemini 2.0)")
+        console.print("\nOctoCLI will try both packages. Install either with:")
+        console.print("pip install google-genai")
+        console.print("or")
+        console.print("pip install google-generativeai")
+        
+        console.print("\n[bold]Get your API key from Google AI Studio:[/bold]")
+        console.print("https://makersuite.google.com/app/apikey")
     
     # For Azure, suggest python-dotenv
     if model_type == "azure":
@@ -2174,20 +2219,35 @@ def list_models():
             console.print("- claude-instant-1.2")
             
         elif llm_type == "gemini":
-            import google.generativeai as genai
-            genai.configure(api_key=config.get('llm_key'))
-            
             console.print("\n[bold]Available Google Gemini Models:[/bold]")
             try:
-                models = genai.list_models()
-                for model in models:
-                    console.print(f"- {model.name}")
+                # Try the new SDK first
+                try:
+                    from google import genai
+                    client = genai.Client(api_key=config.get('llm_key'))
+                    models = client.models.list()
+                    found_models = False
+                    for model in models:
+                        if "gemini" in model.name.lower():
+                            console.print(f"- {model.name}")
+                            found_models = True
+                    if not found_models:
+                        raise ValueError("No Gemini models found")
+                except (ImportError, ValueError):
+                    # Try legacy SDK
+                    import google.generativeai as genai
+                    genai.configure(api_key=config.get('llm_key'))
+                    models = genai.list_models()
+                    for model in models:
+                        console.print(f"- {model.name}")
             except Exception as e:
-                # Fallback to showing known models
+                # Show default models
+                console.print("- gemini-2.0-flash (recommended)")
+                console.print("- gemini-2.0-pro")
                 console.print("- gemini-pro")
                 console.print("- gemini-pro-vision")
-                console.print("- gemini-ultra (if available in your region)")
                 console.print(f"\n[yellow]Error listing models: {str(e)}[/yellow]")
+                console.print("[yellow]Install the required package: pip install google-genai[/yellow]")
                 
         elif llm_type == "cohere":
             console.print("\n[bold]Available Cohere Models:[/bold]")
