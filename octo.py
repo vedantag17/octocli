@@ -3,7 +3,7 @@ from github import Github
 from rich.console import Console
 from rich.tree import Tree
 import os
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import ast
 from radon.complexity import cc_visit
 import base64
@@ -18,11 +18,20 @@ import json
 import configparser
 import click
 import requests
+import shutil
+from dotenv import load_dotenv
+import re
+from octocli.services.analyzer_service import AnalyzerService
 
 app = typer.Typer()
 console = Console()
 
 CONFIG_FILE = "octo_config.ini"
+
+# Token estimation constants - rough approximations
+CHARS_PER_TOKEN = 4  # Approximation for token estimation
+MAX_TOKENS_DEFAULT = 128000  # Default maximum tokens
+MAX_TOKENS_SAFETY_MARGIN = 5000  # Safety margin to stay under limits
 
 class Config:
     def __init__(self):
@@ -30,6 +39,10 @@ class Config:
         # Create config directory in user's home directory
         self.config_dir = os.path.expanduser("~/.octocli")
         self.config_file = os.path.join(self.config_dir, "config.ini")
+        
+        # Load environment variables from .env file if it exists
+        load_dotenv()
+        
         self.load_config()
 
     def load_config(self):
@@ -49,9 +62,31 @@ class Config:
                     'llm_type': '',
                     'llm_key': '',
                     'current_repo': '',
-                    'last_analysis_file': ''
+                    'last_analysis_file': '',
+                    'azure_endpoint': '',
+                    'azure_deployment': '',
+                    'azure_api_version': ''
                 }
                 self.save_config()
+                
+            # Set environment variables for Azure OpenAI if configured
+            if self.config['DEFAULT'].get('llm_type') == 'azure':
+                azure_endpoint = self.config['DEFAULT'].get('azure_endpoint', '')
+                if azure_endpoint:
+                    os.environ['AZURE_OPENAI_ENDPOINT'] = azure_endpoint
+                
+                azure_deployment = self.config['DEFAULT'].get('azure_deployment', '')
+                if azure_deployment:
+                    os.environ['AZURE_OPENAI_DEPLOYMENT'] = azure_deployment
+                
+                azure_api_version = self.config['DEFAULT'].get('azure_api_version', '')
+                if azure_api_version:
+                    os.environ['AZURE_OPENAI_API_VERSION'] = azure_api_version
+                
+                # Set API key if available
+                azure_api_key = self.config['DEFAULT'].get('llm_key', '')
+                if azure_api_key:
+                    os.environ['AZURE_OPENAI_API_KEY'] = azure_api_key
                 
         except Exception as e:
             console.print(f"[yellow]Warning: Could not load config: {str(e)}[/yellow]")
@@ -61,7 +96,10 @@ class Config:
                 'llm_type': '',
                 'llm_key': '',
                 'current_repo': '',
-                'last_analysis_file': ''
+                'last_analysis_file': '',
+                'azure_endpoint': '',
+                'azure_deployment': '',
+                'azure_api_version': ''
             }
 
     def save_config(self):
@@ -276,6 +314,47 @@ class GitHubAnalyzer:
                     ]
                 )
                 return response.choices[0].message.content
+            elif llm_type == "azure":
+                # Azure OpenAI endpoint integration
+                import openai
+                
+                # Get Azure specific settings from environment, .env file, or config
+                azure_api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
+                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or self.config.get('azure_endpoint')
+                azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT") or self.config.get('azure_deployment')
+                azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15") or self.config.get('azure_api_version', "2023-05-15")
+                
+                try:
+                    # Try new OpenAI client format (>=1.0.0)
+                    from openai import AzureOpenAI
+                    client = AzureOpenAI(
+                        api_key=azure_api_key,
+                        api_version=azure_api_version,
+                        azure_endpoint=azure_endpoint
+                    )
+                    response = client.chat.completions.create(
+                        model=azure_deployment,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful code analysis assistant."},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    return response.choices[0].message.content
+                except (ImportError, AttributeError):
+                    # Fall back to legacy format for older OpenAI versions
+                    openai.api_type = "azure"
+                    openai.api_key = azure_api_key
+                    openai.api_base = azure_endpoint
+                    openai.api_version = azure_api_version
+                    
+                    response = openai.ChatCompletion.create(
+                        deployment_id=azure_deployment,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful code analysis assistant."},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    return response.choices[0].message.content
             elif llm_type == "anthropic":
                 client = anthropic.Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
                 response = client.messages.create(
@@ -369,11 +448,25 @@ class CodebaseFetcher:
                     # Exclude JSON and Markdown files
                     if not (file_content.path.endswith('.json') or file_content.path.endswith('.md')):
                         try:
+                            # Handle binary files properly
+                            try:
+                                if file_content.content:
+                                    decoded_content = file_content.decoded_content.decode('utf-8')
+                                else:
+                                    decoded_content = None
+                            except UnicodeDecodeError:
+                                # Skip binary files that can't be decoded as UTF-8
+                                console.print(f"[yellow]Skipping binary file: {file_content.path}[/yellow]")
+                                decoded_content = None
+                            
                             code_files.append({
                                 "path": file_content.path,
-                                "content": file_content.decoded_content.decode('utf-8') if file_content.content else None
+                                "content": decoded_content
                             })
-                            console.print(f"Fetched: {file_content.path}")
+                            
+                            if decoded_content is not None:
+                                console.print(f"Fetched: {file_content.path}")
+                            
                         except Exception as e:
                             console.print(f"[yellow]Warning: Could not fetch {file_content.path}: {str(e)}[/yellow]")
                             continue
@@ -541,14 +634,59 @@ def config(
 @app.command()
 def analyze(
     repo_url: str = typer.Option(None, help="GitHub repository URL (optional if default repo is set)"),
+    local_path: str = typer.Option(None, help="Local path to repository (for offline analysis)"),
+    enhanced_readme: bool = typer.Option(True, help="Generate enhanced readme with code examples for LLMs"),
+    max_tokens: int = typer.Option(MAX_TOKENS_DEFAULT, help="Maximum tokens to include in analysis file"),
+    summary_only: bool = typer.Option(False, help="Generate only high-level summary without detailed code"),
+    prioritize_code: bool = typer.Option(True, help="Prioritize code over documentation when reducing size")
 ):
     """Analyze codebase and generate comprehensive documentation"""
     config = Config()
     
+    # Check if we're analyzing a remote or local repository
+    if local_path and os.path.exists(local_path):
+        try:
+            console.print(f"[bold blue]Analyzing local repository at: {local_path}[/bold blue]")
+            
+            # Import the analyzer service
+            try:
+                analyzer_service = AnalyzerService(local_path)
+                analysis_results = analyzer_service.analyze_repository()
+                
+                # Generate enhanced README with code examples if requested
+                if enhanced_readme:
+                    readme_content = analyzer_service.generate_codebase_readme(
+                        analysis_results, 
+                        max_tokens=max_tokens,
+                        summary_only=summary_only
+                    )
+                    analysis_file = "codebase_analysis.md"
+                    
+                    with open(analysis_file, "w", encoding='utf-8') as f:
+                        f.write(readme_content)
+                    
+                    # Estimate token count of the final file
+                    estimated_tokens = estimate_tokens(readme_content)
+                    
+                    console.print(f"[bold green]Enhanced analysis complete! Results saved in {analysis_file}[/bold green]")
+                    console.print(f"[yellow]Estimated token count: {estimated_tokens:,}[/yellow]")
+                    console.print("[yellow]This enhanced README includes code snippets to help LLMs understand your codebase.[/yellow]")
+                    
+                return analysis_results
+                
+            except ImportError:
+                console.print("[yellow]Could not import AnalyzerService. Falling back to basic analysis.[/yellow]")
+                # Continue with basic analysis if service isn't available
+            
+        except Exception as e:
+            console.print(f"[bold red]Error analyzing local repository: {str(e)}[/bold red]")
+            raise typer.Exit(1)
+    
+    # Remote repository analysis
     if not repo_url:
         repo_url = config.get('current_repo')
         if not repo_url:
-            console.print("[red]No repository specified. Use --repo-url URL[/red]")
+            console.print("[red]No repository specified. Use --repo-url URL or --local-path PATH[/red]")
             raise typer.Exit(1)
 
     try:
@@ -561,6 +699,10 @@ def analyze(
         contents = repo.get_contents("")
         all_files_info = []
         structure = {}
+        
+        # Prepare for extra analysis if enhanced_readme is enabled
+        important_functions = {}
+        file_stats = {}
 
         with console.status("[bold green]Analyzing files...") as status:
             while contents:
@@ -607,12 +749,46 @@ def analyze(
                     else:
                         try:
                             # Only try to analyze text-based files
-                            if file_path.lower().endswith(('.py', '.md', '.txt', '.json', '.yml', '.yaml', '.js', '.jsx', '.ts', '.tsx', '.html', '.css')):
+                            supported_extensions = ('.py', '.md', '.txt', '.json', '.yml', '.yaml', '.js', '.jsx', '.ts', '.tsx', '.html', '.css')
+                            if file_path.lower().endswith(supported_extensions):
                                 try:
                                     decoded_content = file_content.decoded_content
                                     file_info = analyzer.analyze_file_content(decoded_content, file_path)
                                     all_files_info.append(file_info)
                                     console.print(f"Analyzed: {file_path}")
+                                    
+                                    # If enhanced readme is requested, perform extra analysis
+                                    if enhanced_readme and file_path.lower().endswith(('.py', '.js', '.jsx', '.ts')):
+                                        # Compute basic stats for the file
+                                        content_str = decoded_content.decode('utf-8')
+                                        file_stats[file_path] = {
+                                            'lines': content_str.count('\n') + 1,
+                                            'size': len(content_str)
+                                        }
+                                        
+                                        # For Python files, extract important functions and classes
+                                        if file_path.endswith('.py'):
+                                            try:
+                                                temp_file = os.path.join(os.path.dirname(__file__), "temp_code.py")
+                                                with open(temp_file, 'w', encoding='utf-8') as f:
+                                                    f.write(content_str)
+                                                
+                                                # Import the analyzer service
+                                                try:
+                                                    from octocli.services.analyzer_service import AnalyzerService
+                                                    temp_analyzer = AnalyzerService(os.path.dirname(__file__))
+                                                    important_funcs = temp_analyzer.extract_important_functions(temp_file)
+                                                    if important_funcs:
+                                                        important_functions[file_path] = important_funcs
+                                                except ImportError:
+                                                    pass
+                                                
+                                                # Clean up temp file
+                                                if os.path.exists(temp_file):
+                                                    os.remove(temp_file)
+                                            except Exception as e:
+                                                console.print(f"[yellow]Warning: Could not extract functions from {file_path}: {str(e)}[/yellow]")
+                                    
                                 except Exception as e:
                                     console.print(f"[yellow]Warning: Could not analyze {file_path}: {str(e)}[/yellow]")
                             else:
@@ -626,38 +802,309 @@ def analyze(
                     continue
 
         # Generate analysis content
-        analysis_content = ["# Repository Analysis\n"]
-        analysis_content.append(f"## Repository: {repo.full_name}\n")
-        analysis_content.append(f"Description: {repo.description or 'No description provided'}\n")
-        
-        # Add repository structure
-        analysis_content.append("\n## Repository Structure\n```\n")
-        analysis_content.append(analyzer.generate_tree_structure(structure))
-        analysis_content.append("```\n")
-
-        # Add documentation analysis
-        analysis_content.append("\n## Documentation Analysis\n")
-        markdown_files = [f for f in all_files_info if f.get('type') == 'markdown']
-        if markdown_files:
-            for file_info in markdown_files:
-                analysis_content.append(analyzer.generate_file_summary(file_info))
+        if enhanced_readme and len(important_functions) > 0:
+            # Use the advanced readme generation if we've extracted functions
+            analysis_content = ["# Repository Analysis - Enhanced for LLM Understanding\n"]
+            analysis_content.append(f"## Repository: {repo.full_name}\n")
+            analysis_content.append(f"Description: {repo.description or 'No description provided'}\n")
+            
+            # Add repository structure
+            analysis_content.append("\n## Repository Structure\n```\n")
+            analysis_content.append(analyzer.generate_tree_structure(structure))
+            analysis_content.append("```\n")
+            
+            # Estimate current token count
+            current_content = "\n".join(str(line) for line in analysis_content if line is not None)
+            current_tokens = estimate_tokens(current_content)
+            
+            # Maximum tokens for the markdown/code sections
+            remaining_tokens = max_tokens - current_tokens - MAX_TOKENS_SAFETY_MARGIN
+            
+            # Add documentation analysis (from basic analysis)
+            if remaining_tokens > 0 and not summary_only:
+                analysis_content.append("\n## Documentation\n")
+                markdown_files = [f for f in all_files_info if f.get('type') == 'markdown']
+                
+                if markdown_files:
+                    # Sort markdown files by potential importance (README.md should come first)
+                    sorted_md_files = sorted(markdown_files, key=lambda f: 
+                                           0 if f['path'].lower() == 'readme.md' else 
+                                           1 if 'readme' in f['path'].lower() else 
+                                           2 if 'docs' in f['path'].lower() else 3)
+                    
+                    # Prioritize based on available tokens
+                    md_limit = min(len(sorted_md_files), 3 if prioritize_code else 5)
+                    for file_info in sorted_md_files[:md_limit]:
+                        doc_summary = analyzer.generate_file_summary(file_info)
+                        # Check if adding this would exceed token limit
+                        if estimate_tokens(doc_summary) < remaining_tokens:
+                            analysis_content.append(doc_summary)
+                            remaining_tokens -= estimate_tokens(doc_summary)
+                        else:
+                            # Add truncated version
+                            truncated_summary = truncate_content(doc_summary, remaining_tokens)
+                            analysis_content.append(truncated_summary)
+                            remaining_tokens = 0
+                            break
+                else:
+                    analysis_content.append("No markdown documentation files found.\n")
+            
+            # Add core components section with code snippets
+            if remaining_tokens > 0 and not summary_only:
+                analysis_content.append("\n## Core Components and Code\n")
+                
+                # Sort functions by importance (prioritize larger files with more functions)
+                sorted_files = sorted(
+                    important_functions.items(), 
+                    key=lambda x: (
+                        # Main app files first
+                        0 if 'app.py' in x[0] or 'main.py' in x[0] or '__main__.py' in x[0] else
+                        1 if 'cli.py' in x[0] or 'commands' in x[0] else
+                        2,
+                        # Then by number of functions/classes (descending)
+                        -len(x[1]),
+                        # Then by file path alphabetically
+                        x[0]
+                    )
+                )
+                
+                for file_path, functions in sorted_files:
+                    if not functions or remaining_tokens <= 0:
+                        continue
+                    
+                    file_header = f"\n### {file_path}\n"
+                    analysis_content.append(file_header)
+                    remaining_tokens -= estimate_tokens(file_header)
+                    
+                    # Group by type
+                    classes = [f for f in functions if f.get('type') == 'class']
+                    standalone_functions = [f for f in functions if f.get('type') == 'function']
+                    
+                    # Add classes first - they're usually more important
+                    for class_info in classes:
+                        if remaining_tokens <= 0:
+                            break
+                            
+                        class_name = class_info.get('name', 'Unknown')
+                        docstring = class_info.get('docstring', '').strip()
+                        code = class_info.get('code', '')
+                        
+                        class_section = f"#### Class: {class_name}\n"
+                        if docstring:
+                            class_section += f"{docstring}\n"
+                        
+                        # Add class code
+                        file_ext = os.path.splitext(file_path)[1].lstrip('.')
+                        if not file_ext:
+                            file_ext = 'python' if file_path.endswith('.py') else 'javascript'
+                        
+                        code_block = f"```{file_ext}\n{code}\n```\n"
+                        class_section += code_block
+                        
+                        # Check token count before adding
+                        class_tokens = estimate_tokens(class_section)
+                        if class_tokens < remaining_tokens:
+                            analysis_content.append(class_section)
+                            remaining_tokens -= class_tokens
+                        else:
+                            # Add summary instead of full code
+                            summary = f"#### Class: {class_name}\n"
+                            if docstring:
+                                summary += f"{docstring}\n"
+                            summary += f"*Class code omitted to save context space (approx. {class_tokens} tokens)*\n"
+                            analysis_content.append(summary)
+                            remaining_tokens -= estimate_tokens(summary)
+                        
+                        # Add methods if available and we have tokens left
+                        methods = class_info.get('methods', [])
+                        if methods and remaining_tokens > 0:
+                            methods_section = "**Methods:**\n"
+                            for method in methods:
+                                method_name = method.get('name', 'Unknown')
+                                method_docstring = method.get('docstring', '').strip()
+                                method_line = f"- `{method_name}`: {method_docstring or 'No description'}\n"
+                                
+                                if estimate_tokens(method_line) < remaining_tokens:
+                                    methods_section += method_line
+                                    remaining_tokens -= estimate_tokens(method_line)
+                                else:
+                                    methods_section += "- *Additional methods omitted to save context space*\n"
+                                    remaining_tokens -= 50  # Approximate tokens for the omitted line
+                                    break
+                                    
+                            analysis_content.append(methods_section)
+                
+                    # Add standalone functions if we have tokens left
+                    if standalone_functions and remaining_tokens > 0:
+                        functions_header = "\n#### Key Functions\n"
+                        analysis_content.append(functions_header)
+                        remaining_tokens -= estimate_tokens(functions_header)
+                        
+                        # Sort functions by importance (name length as a heuristic)
+                        sorted_functions = sorted(
+                            standalone_functions,
+                            key=lambda x: (
+                                # 'main' functions first
+                                0 if x.get('name', '') == 'main' else
+                                # Then by docstring length (more documented = more important)
+                                -len(x.get('docstring', '')),
+                                # Then by code length (longer = more complex)
+                                -len(x.get('code', ''))
+                            )
+                        )
+                        
+                        for func_info in sorted_functions:
+                            if remaining_tokens <= 0:
+                                break
+                                
+                            func_name = func_info.get('name', 'Unknown')
+                            docstring = func_info.get('docstring', '').strip()
+                            code = func_info.get('code', '')
+                            
+                            func_section = f"##### `{func_name}`\n"
+                            if docstring:
+                                func_section += f"{docstring}\n"
+                            
+                            # Add function code
+                            file_ext = os.path.splitext(file_path)[1].lstrip('.')
+                            if not file_ext:
+                                file_ext = 'python' if file_path.endswith('.py') else 'javascript'
+                            
+                            code_block = f"```{file_ext}\n{code}\n```\n"
+                            func_section += code_block
+                            
+                            # Check token count before adding
+                            func_tokens = estimate_tokens(func_section)
+                            if func_tokens < remaining_tokens:
+                                analysis_content.append(func_section)
+                                remaining_tokens -= func_tokens
+                            else:
+                                # Add summary instead of full code
+                                summary = f"##### `{func_name}`\n"
+                                if docstring:
+                                    summary += f"{docstring}\n"
+                                summary += f"*Function code omitted to save context space (approx. {func_tokens} tokens)*\n"
+                                analysis_content.append(summary)
+                                remaining_tokens -= estimate_tokens(summary)
+            
+            # Add usage guidelines if we have tokens left
+            if remaining_tokens > 0:
+                analysis_content.append("\n## Usage Guidelines\n")
+                analysis_content.append("This section shows how to use the main components of the codebase.\n")
+                
+                # Look for main entry points
+                main_files = []
+                for file_path in file_stats.keys():
+                    if file_path.endswith(('main.py', 'app.py', 'cli.py', 'index.js')):
+                        main_files.append(file_path)
+                
+                if main_files and remaining_tokens > 200:  # Only add if we have enough tokens left
+                    analysis_content.append("### Getting Started\n")
+                    for main_file in main_files:
+                        if main_file.endswith('.py'):
+                            example = f"```python\n# Example usage of {main_file}\nimport {os.path.splitext(os.path.basename(main_file))[0]}\n\n# See class and function documentation above for details\n```"
+                            if estimate_tokens(example) < remaining_tokens:
+                                analysis_content.append(example)
+                                remaining_tokens -= estimate_tokens(example)
+                        elif main_file.endswith('.js'):
+                            example = f"```javascript\n// Example usage of {main_file}\nconst app = require('./{os.path.splitext(os.path.basename(main_file))[0]}');\n\n// See class and function documentation above for details\n```"
+                            if estimate_tokens(example) < remaining_tokens:
+                                analysis_content.append(example)
+                                remaining_tokens -= estimate_tokens(example)
         else:
-            analysis_content.append("No markdown documentation files found.\n")
+            # Use the original format if we don't have enhanced data, but still apply token limits
+            analysis_content = ["# Repository Analysis\n"]
+            analysis_content.append(f"## Repository: {repo.full_name}\n")
+            analysis_content.append(f"Description: {repo.description or 'No description provided'}\n")
+            
+            # Add repository structure
+            analysis_content.append("\n## Repository Structure\n```\n")
+            analysis_content.append(analyzer.generate_tree_structure(structure))
+            analysis_content.append("```\n")
+            
+            # Estimate current token count
+            current_content = "\n".join(str(line) for line in analysis_content if line is not None)
+            current_tokens = estimate_tokens(current_content)
+            remaining_tokens = max_tokens - current_tokens - MAX_TOKENS_SAFETY_MARGIN
+            
+            # Add documentation analysis
+            if remaining_tokens > 0 and not summary_only:
+                analysis_content.append("\n## Documentation Analysis\n")
+                markdown_files = [f for f in all_files_info if f.get('type') == 'markdown']
+                if markdown_files:
+                    # Sort by importance (README.md first)
+                    sorted_md_files = sorted(markdown_files, key=lambda f: 
+                                          0 if f['path'].lower() == 'readme.md' else 
+                                          1 if 'readme' in f['path'].lower() else 
+                                          2)
+                                          
+                    for file_info in sorted_md_files:
+                        if remaining_tokens <= 0:
+                            break
+                            
+                        file_summary = analyzer.generate_file_summary(file_info)
+                        summary_tokens = estimate_tokens(file_summary)
+                        
+                        if summary_tokens < remaining_tokens:
+                            analysis_content.append(file_summary)
+                            remaining_tokens -= summary_tokens
+                        else:
+                            # Add truncated summary
+                            truncated = truncate_content(file_summary, remaining_tokens)
+                            analysis_content.append(truncated)
+                            remaining_tokens = 0
+                            break
+                else:
+                    analysis_content.append("No markdown documentation files found.\n")
 
-        # Add code analysis
-        analysis_content.append("\n## Code Analysis\n")
-        code_files = [f for f in all_files_info if f.get('type') == 'code']
-        if code_files:
-            for file_info in code_files:
-                analysis_content.append(analyzer.generate_file_summary(file_info))
-        else:
-            analysis_content.append("No code files found.\n")
+            # Add code analysis
+            if remaining_tokens > 0 and not summary_only:
+                analysis_content.append("\n## Code Analysis\n")
+                code_files = [f for f in all_files_info if f.get('type') == 'code']
+                if code_files:
+                    # Sort by size or number of functions
+                    sorted_code_files = sorted(code_files, 
+                                            key=lambda f: 
+                                            len(f.get('functions', [])) + len(f.get('classes', [])),
+                                            reverse=True)
+                                            
+                    for file_info in sorted_code_files:
+                        if remaining_tokens <= 0:
+                            break
+                            
+                        file_summary = analyzer.generate_file_summary(file_info)
+                        summary_tokens = estimate_tokens(file_summary)
+                        
+                        if summary_tokens < remaining_tokens:
+                            analysis_content.append(file_summary)
+                            remaining_tokens -= summary_tokens
+                        else:
+                            # Add truncated summary
+                            truncated = truncate_content(file_summary, remaining_tokens)
+                            analysis_content.append(truncated)
+                            remaining_tokens = 0
+                            break
+                else:
+                    analysis_content.append("No code files found.\n")
+            
+            # Add token count information at the end
+            estimated_total = max_tokens - remaining_tokens
+            analysis_content.append(f"\n\n*Analysis contains approximately {estimated_total:,} tokens (max allowed: {max_tokens:,})*\n")
 
         # Ensure the analysis file is saved in the current directory
         analysis_file = "codebase_analysis.md"
         try:
             # Ensure the content is properly joined
             final_content = "\n".join(str(line) for line in analysis_content if line is not None)
+            
+            # Estimate final token count
+            final_tokens = estimate_tokens(final_content)
+            
+            # Check if we're under the limit, if not add a warning
+            if final_tokens > max_tokens:
+                warning = f"\n\n**WARNING: This analysis may exceed the {max_tokens:,} token limit with approximately {final_tokens:,} tokens.**\n"
+                warning += "Consider using the --max-tokens option to set a lower limit or --summary-only for a briefer analysis.\n"
+                final_content += warning
             
             # Check if the file exists, if not create it
             if not os.path.exists(analysis_file):
@@ -669,6 +1116,9 @@ def analyze(
                     f.write(final_content)
             
             console.print(f"[bold green]Analysis complete! Results updated in {analysis_file}[/bold green]")
+            console.print(f"[yellow]Estimated token count: {final_tokens:,} tokens[/yellow]")
+            if enhanced_readme:
+                console.print("[yellow]The enhanced README includes code snippets to help LLMs understand your codebase.[/yellow]")
             
         except Exception as e:
             console.print(f"[red]Error saving analysis: {str(e)}[/red]")
@@ -679,6 +1129,76 @@ def analyze(
     except Exception as e:
         console.print(f"[bold red]Error: {str(e)}[/bold red]")
         raise typer.Exit(1)
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate the number of tokens in a text string.
+    This is a rough approximation based on character count.
+    """
+    if not text:
+        return 0
+    return len(text) // CHARS_PER_TOKEN
+
+def truncate_content(content: str, max_tokens: int) -> str:
+    """
+    Truncate content to fit within token limit.
+    Preserves markdown structure where possible.
+    """
+    if estimate_tokens(content) <= max_tokens:
+        return content
+    
+    # Convert tokens to characters for truncation
+    max_chars = max_tokens * CHARS_PER_TOKEN
+    
+    # If content is very small, just return the first part
+    if len(content) < max_chars * 2:
+        return content[:max_chars] + "...\n*(content truncated to fit token limit)*"
+    
+    # Try to preserve structure - split by headers
+    headers = re.split(r'(^##+ .*$)', content, flags=re.MULTILINE)
+    
+    # Build the truncated content
+    result = []
+    current_length = 0
+    
+    # Always include the first section (usually the title)
+    if headers and not headers[0].startswith('#'):
+        result.append(headers[0])
+        current_length += len(headers[0])
+    
+    # Process header sections
+    i = 1
+    while i < len(headers):
+        # Each header section consists of a header (i) and content (i+1)
+        if i+1 < len(headers):
+            header = headers[i]
+            content = headers[i+1]
+            section_length = len(header) + len(content)
+            
+            # If adding this section would exceed the limit
+            if current_length + section_length > max_chars:
+                # If it's just slightly over, try to include a truncated version
+                if current_length + len(header) + 100 < max_chars:
+                    chars_left = max_chars - current_length - len(header)
+                    result.append(header)
+                    result.append(content[:chars_left] + "...\n*(content truncated)*")
+                else:
+                    # Otherwise just note that sections were omitted
+                    result.append("\n\n*(additional sections omitted to fit token limit)*")
+                break
+            
+            result.append(header)
+            result.append(content)
+            current_length += section_length
+        else:
+            # Handle odd number of splits (last item might be a header with no content)
+            if current_length + len(headers[i]) < max_chars:
+                result.append(headers[i])
+            break
+        
+        i += 2
+    
+    return "".join(result)
 
 @app.command()
 def tell(
@@ -1083,31 +1603,44 @@ def issue(
 def fetch_codebase(
     repo_url: str = typer.Argument(..., help="GitHub repository URL"),
 ):
-    """Fetch the entire codebase excluding JSON and Markdown files."""
+    """Fetch the entire codebase from a GitHub repository"""
     config = Config()
     github_token = config.get('github_token')
-    
     if not github_token:
         console.print("[red]GitHub token not found. Use 'octo config --github-token YOUR_TOKEN'[/red]")
         raise typer.Exit(1)
 
     fetcher = CodebaseFetcher(github_token)
-    
     try:
+        console.print(f"[bold blue]Fetching codebase from {repo_url}...[/bold blue]")
         code_files = fetcher.fetch_codebase(repo_url)
         
-        # Save the fetched code files to a local directory
-        output_dir = "fetched_codebase"
-        os.makedirs(output_dir, exist_ok=True)
-
-        for file in code_files:
-            file_path = os.path.join(output_dir, file['path'])
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)  # Create directories if needed
-            with open(file_path, "w", encoding='utf-8') as f:
-                f.write(file['content'])
+        # Create directory to store the fetched codebase
+        fetched_dir = "fetched_codebase"
+        if os.path.exists(fetched_dir):
+            shutil.rmtree(fetched_dir)
+        os.makedirs(fetched_dir)
         
-        console.print(f"[bold green]Codebase fetched successfully! Files saved in '{output_dir}'[/bold green]")
-    
+        # Write the files to the directory
+        for file_info in code_files:
+            file_path = os.path.join(fetched_dir, file_info["path"])
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            # Check if content is None before writing
+            file_content = file_info.get("content")
+            if file_content is not None:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(file_content)
+            else:
+                # Log skipped files
+                console.print(f"[yellow]Skipping binary or empty file: {file_info['path']}[/yellow]")
+        
+        console.print(f"[bold green]Successfully fetched {len(code_files)} files from {repo_url}[/bold green]")
+        console.print(f"The codebase is saved in the '{fetched_dir}' directory")
+        
+        # Update current repo in config
+        config.set('current_repo', repo_url)
+        config.save()
     except Exception as e:
         console.print(f"[bold red]Error fetching codebase: {str(e)}[/bold red]")
         raise typer.Exit(1)
@@ -1120,14 +1653,15 @@ def setup_model():
     # Present expanded model options
     console.print("[bold]Available LLM Models:[/bold]")
     console.print("1. OpenAI (GPT-4)")
-    console.print("2. Anthropic (Claude)")
-    console.print("3. Google (Gemini)")
-    console.print("4. Cohere (Command)")
-    console.print("5. Mistral AI")
-    console.print("6. Meta (Llama)")
+    console.print("2. Azure OpenAI (Deployed Models)")
+    console.print("3. Anthropic (Claude)")
+    console.print("4. Google (Gemini)")
+    console.print("5. Cohere (Command)")
+    console.print("6. Mistral AI")
+    console.print("7. Meta (Llama)")
     
     # Get user choice
-    valid_choices = ["1", "2", "3", "4", "5", "6"]
+    valid_choices = ["1", "2", "3", "4", "5", "6", "7"]
     choice = ""
     while choice not in valid_choices:
         choice = typer.prompt(f"Select a model (1-{len(valid_choices)})")
@@ -1137,29 +1671,32 @@ def setup_model():
     # Set model type based on choice
     model_types = {
         "1": "openai",
-        "2": "anthropic",
-        "3": "gemini",
-        "4": "cohere",
-        "5": "mistral",
-        "6": "llama"
+        "2": "azure",
+        "3": "anthropic",
+        "4": "gemini",
+        "5": "cohere",
+        "6": "mistral",
+        "7": "llama"
     }
     
     model_names = {
         "1": "OpenAI (GPT-4)",
-        "2": "Anthropic (Claude)",
-        "3": "Google (Gemini)",
-        "4": "Cohere (Command)",
-        "5": "Mistral AI",
-        "6": "Meta (Llama)"
+        "2": "Azure OpenAI",
+        "3": "Anthropic (Claude)",
+        "4": "Google (Gemini)",
+        "5": "Cohere (Command)",
+        "6": "Mistral AI",
+        "7": "Meta (Llama)"
     }
     
     model_packages = {
         "1": "openai",
-        "2": "anthropic",
-        "3": "google-generativeai",
-        "4": "cohere",
-        "5": "mistralai",
-        "6": "requests (already installed)"
+        "2": "openai",
+        "3": "anthropic",
+        "4": "google-generativeai",
+        "5": "cohere",
+        "6": "mistralai",
+        "7": "requests (already installed)"
     }
     
     model_type = model_types[choice]
@@ -1170,9 +1707,30 @@ def setup_model():
     console.print(f"\n[bold]Required package: {package_name}[/bold]")
     console.print(f"If not already installed, use: pip install {package_name}")
     
+    # For Azure, suggest python-dotenv
+    if model_type == "azure":
+        console.print(f"For Azure OpenAI, you may also want to install: pip install python-dotenv")
+    
     # Ask for API key
     console.print(f"\n[bold]Please enter your {model_type.upper()} API key:[/bold]")
     api_key = typer.prompt("API Key", hide_input=True)
+    
+    # For Azure, collect additional required information
+    if model_type == "azure":
+        console.print("\n[bold]Azure OpenAI requires additional configuration:[/bold]")
+        azure_endpoint = typer.prompt("Enter your Azure OpenAI endpoint URL (e.g., https://your-resource.openai.azure.com)")
+        azure_deployment = typer.prompt("Enter your Azure OpenAI deployment name")
+        azure_api_version = typer.prompt("Enter API version (default: 2023-05-15)", default="2023-05-15")
+        
+        # Save Azure-specific configuration
+        config.set('azure_endpoint', azure_endpoint)
+        config.set('azure_deployment', azure_deployment)
+        config.set('azure_api_version', azure_api_version)
+        
+        # Set environment variables
+        os.environ["AZURE_OPENAI_ENDPOINT"] = azure_endpoint
+        os.environ["AZURE_OPENAI_DEPLOYMENT"] = azure_deployment
+        os.environ["AZURE_OPENAI_API_VERSION"] = azure_api_version
     
     # Save configuration
     config.set('llm_type', model_type)
@@ -1182,8 +1740,29 @@ def setup_model():
     console.print("You can now use the model with commands like 'octo tell' and 'octo issue'")
     
     # Information about API key environment variables
-    console.print(f"\n[bold]API Key Environment Variable:[/bold] {model_type.upper()}_API_KEY")
-    console.print("You can also set this environment variable instead of storing the key in the config file.")
+    env_var_name = f"{model_type.upper()}_API_KEY"
+    if model_type == "azure":
+        env_var_name = "AZURE_OPENAI_API_KEY"
+        console.print(f"\n[bold]Azure OpenAI Environment Variables:[/bold]")
+        console.print(f"- {env_var_name}: Your Azure OpenAI API key")
+        console.print(f"- AZURE_OPENAI_ENDPOINT: {config.get('azure_endpoint')}")
+        console.print(f"- AZURE_OPENAI_DEPLOYMENT: {config.get('azure_deployment')}")
+        console.print(f"- AZURE_OPENAI_API_VERSION: {config.get('azure_api_version')}")
+        
+        # Add information about .env file
+        console.print("\n[bold]Using .env files:[/bold]")
+        console.print("You can also store these values in a .env file in your project directory:")
+        console.print("""
+Example .env file:
+AZURE_OPENAI_API_KEY=your_api_key_here
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=your_deployment_name
+AZURE_OPENAI_API_VERSION=2023-05-15
+        """)
+    else:
+        console.print(f"\n[bold]API Key Environment Variable:[/bold] {env_var_name}")
+    
+    console.print("You can set these environment variables instead of storing values in the config file.")
 
 @app.command()
 def codebase_info():
@@ -1235,6 +1814,144 @@ def codebase_info():
     console.print("Run 'octo issue --use-fetched <issue_number>' to analyze GitHub issues with the fetched codebase")
     
     return organized_codebase
+
+@app.command()
+def list_models():
+    """List available models for the configured LLM provider"""
+    config = Config()
+    llm_type = config.get('llm_type')
+    
+    if not llm_type:
+        console.print("[red]No LLM type configured. Use 'octo setup_model' first.[/red]")
+        raise typer.Exit(1)
+        
+    console.print(f"[bold]Listing models for {llm_type}...[/bold]")
+    
+    try:
+        if llm_type == "openai":
+            import openai
+            openai.api_key = config.get('llm_key')
+            models = openai.Model.list()
+            
+            console.print("\n[bold]Available OpenAI Models:[/bold]")
+            for model in models['data']:
+                console.print(f"- {model['id']}")
+                
+        elif llm_type == "azure":
+            # For Azure OpenAI, we need to fetch models directly from the deployment
+            azure_api_key = config.get('llm_key')
+            azure_endpoint = config.get('azure_endpoint')
+            azure_api_version = config.get('azure_api_version', '2023-05-15')
+            
+            if not azure_endpoint:
+                console.print("[red]Azure OpenAI endpoint not configured. Use 'octo setup_model' first.[/red]")
+                raise typer.Exit(1)
+                
+            try:
+                # Try using the newer OpenAI client
+                from openai import AzureOpenAI
+                client = AzureOpenAI(
+                    api_key=azure_api_key,
+                    api_version=azure_api_version,
+                    azure_endpoint=azure_endpoint
+                )
+                
+                console.print("\n[bold]Available Azure OpenAI Deployments:[/bold]")
+                
+                # For newer clients, directly list deployments
+                try:
+                    models = client.models.list()
+                    for model in models.data:
+                        console.print(f"- {model.id}")
+                except Exception as e:
+                    # If direct model listing fails, display the configured deployment
+                    azure_deployment = config.get('azure_deployment')
+                    console.print(f"- {azure_deployment} (configured deployment)")
+                    console.print("\n[yellow]Note: Could not list all deployments. Make sure your API key has proper permissions.[/yellow]")
+                    console.print(f"[yellow]Error: {str(e)}[/yellow]")
+                
+            except (ImportError, AttributeError):
+                # Fall back to legacy client
+                import openai
+                openai.api_type = "azure"
+                openai.api_key = azure_api_key
+                openai.api_base = azure_endpoint
+                openai.api_version = azure_api_version
+                
+                try:
+                    # Try to list models, but this might not work in all Azure setups
+                    models = openai.Model.list()
+                    console.print("\n[bold]Available Azure OpenAI Models:[/bold]")
+                    for model in models['data']:
+                        console.print(f"- {model['id']}")
+                except Exception as e:
+                    # If that fails, show the configured deployment
+                    azure_deployment = config.get('azure_deployment')
+                    console.print(f"- {azure_deployment} (configured deployment)")
+                    console.print("\n[yellow]Note: Could not list all models. Make sure your API key has proper permissions.[/yellow]")
+                    console.print(f"[yellow]Error: {str(e)}[/yellow]")
+                
+            # Show the current configuration
+            console.print("\n[bold]Current Azure OpenAI Configuration:[/bold]")
+            console.print(f"Endpoint: {azure_endpoint}")
+            console.print(f"Deployment: {config.get('azure_deployment')}")
+            console.print(f"API Version: {azure_api_version}")
+            
+        elif llm_type == "anthropic":
+            console.print("\n[bold]Available Anthropic Models:[/bold]")
+            console.print("- claude-3-opus-20240229")
+            console.print("- claude-3-sonnet-20240229")
+            console.print("- claude-3-haiku-20240307")
+            console.print("- claude-2.1")
+            console.print("- claude-2.0")
+            console.print("- claude-instant-1.2")
+            
+        elif llm_type == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.get('llm_key'))
+            
+            console.print("\n[bold]Available Google Gemini Models:[/bold]")
+            try:
+                models = genai.list_models()
+                for model in models:
+                    console.print(f"- {model.name}")
+            except Exception as e:
+                # Fallback to showing known models
+                console.print("- gemini-pro")
+                console.print("- gemini-pro-vision")
+                console.print("- gemini-ultra (if available in your region)")
+                console.print(f"\n[yellow]Error listing models: {str(e)}[/yellow]")
+                
+        elif llm_type == "cohere":
+            console.print("\n[bold]Available Cohere Models:[/bold]")
+            console.print("- command")
+            console.print("- command-light")
+            console.print("- command-r")
+            console.print("- command-r-plus")
+            
+        elif llm_type == "mistral":
+            console.print("\n[bold]Available Mistral AI Models:[/bold]")
+            console.print("- mistral-tiny")
+            console.print("- mistral-small")
+            console.print("- mistral-medium")
+            console.print("- mistral-large-latest")
+            
+        elif llm_type == "llama":
+            console.print("\n[bold]Available Llama Models (via Together API):[/bold]")
+            console.print("- meta-llama/Llama-3-70b-chat-hf")
+            console.print("- meta-llama/Llama-3-8b-chat-hf")
+            console.print("- meta-llama/Llama-2-70b-chat-hf")
+        
+        else:
+            console.print(f"[red]Unsupported LLM type: {llm_type}[/red]")
+            
+    except ImportError as e:
+        console.print(f"[red]Error: The required package for {llm_type} is not installed.[/red]")
+        console.print(f"[yellow]Details: {str(e)}[/yellow]")
+        console.print(f"[yellow]Try installing the package: pip install {llm_type}[/yellow]")
+        
+    except Exception as e:
+        console.print(f"[red]Error listing models: {str(e)}[/red]")
 
 if __name__ == "__main__":
     app() 

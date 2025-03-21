@@ -9,4 +9,5 @@ anthropic>=0.18.1
 google-generativeai>=0.3.0
 cohere>=4.37
 mistralai>=0.0.9
-requests>=2.31.0 
+requests>=2.31.0
+python-dotenv>=1.0.0 
