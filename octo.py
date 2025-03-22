@@ -1774,6 +1774,11 @@ def issue(
     config = Config()
     analyzer = GitHubAnalyzer(config.get('github_token'))
     
+    # Import Rich components needed for formatting
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich import box
+    
     if use_fetched:
         # Read from the fetched codebase
         fetched_dir = "fetched_codebase"
@@ -1884,9 +1889,6 @@ def issue(
         console.print(f"[bold blue]Analyzing issue #{issue_number} using the fetched codebase...[/bold blue]")
         response = analyzer.query_llm(prompt, config.get('llm_type'), config.get('llm_key'))
         
-        console.print(f"\n[bold blue]Analysis for Issue #{issue_number}[/bold blue]")
-        console.print(f"[bold]{issue_context.strip()}[/bold]\n")
-        
         if raw_output:
             console.print(response)
         else:
@@ -1961,9 +1963,6 @@ def issue(
             # Query LLM for analysis
             console.print(f"[bold blue]Analyzing issue #{issue.number} using repository analysis...[/bold blue]")
             response = analyzer.query_llm(prompt, config.get('llm_type'), config.get('llm_key'))
-            
-            console.print(f"\n[bold blue]Analysis for Issue #{issue.number}[/bold blue]")
-            console.print(f"[bold]{issue.title}[/bold]\n")
             
             if raw_output:
                 console.print(response)
