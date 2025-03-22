@@ -28,11 +28,10 @@ pip install .
 
 
 ---
-# Start the CLI
-![WhatsApp Image 2025-03-22 at 05 23 34_8c0d46fe](https://github.com/user-attachments/assets/11139736-79c4-47b9-bcc1-bc5368e5db06)
+## Start the CLI
+![WhatsApp Image 2025-03-22 at 05 23 34_7a94d29e](https://github.com/user-attachments/assets/b7f489ee-0c47-43ef-ada1-8e0166fb7091)
 
-# Commands
-![Uploading WhatsApp Image 2025-03-22 at 05.22.15_e4b42286.jpg…]()
-
+## Commands
+![WhatsApp Image 2025-03-22 at 05 22 15_ba01756d](https://github.com/user-attachments/assets/135b4a9b-4abb-46d1-b510-c01f0127ff08)
 
 ---
