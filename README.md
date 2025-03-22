@@ -1,54 +1,37 @@
-# 🐙 Octo — Your AI-Powered GitHub Companion 
-
+# 🐙 Octo – The AI GitHub Assistant
 **Octo** is a command-line tool with commands similar to git. It is powered by Large Language Models it allows users to QA the GitHub repository with native git commands and add a tell command that answers all your questions regarding the repository.
- 
-Just provide a GitHub issue link or issue number — Octo will:  
-- Fetch the repo's file structure  
-- Display and summarize the README  
-- Index everything into a vector database  
-- Let you ask questions interactively via an LLM-powered assistant  
 
-Perfect for contributors, QAs, and developers of all skill levels — Octo ensures a smooth, productive, and beginner-friendly experience.  
+## Description
+When contributing to a project on GitHub, a developer needs to adapt/learn the Project goals, specifications. Commercially available LLMs do not read a whole repository, a developer needs to manually browse through each folder, sub-folder and its contents etc. Each folder varies in size and structural complexity. Manual browsing takes much time of developer, decreasing productivity.
+
+Unlike other commercially available LLMs, **Octo**, A CLI application can directly ingest a GitHub repository when given the link. It fetches all file structures, issues, codebases etc. It creates a Readme markdown file in memory which acts as a knowledge base of the dedicated repository for fast retrieval, for user interaction. Octo saves much time of developers i.e switching between tabs, manual code reviewing. Octo understands the Repository and the relationships present in it, providing better insights, and accurate explainations.
 
 ---
-
-## Key Features  
-- **Fetch by Issue Link or Issue Number**  
+## Key Features   
 - **Display Repository File Structure in CLI**  
-- **Read and Summarize README**  
-- **Index Data Using PyMilvus for Smart Retrieval**  
-- **LLM-Powered Chat for Q&A about Issues/Repo**  
-- **Designed for Beginners & Experts**  
-
+- **Read and Summarize README**    
+- **LLM-Powered Chat for Q&A about Issues/Repo**   
 ---
 
-## Tech Stack  
-- **Vector Database**: PyMilvus  
-- **GitHub API**: GitHub Python package  
+## Tech Stack   
+- **PyGitHub**: GitHub Python package
 - **CLI Framework**: Typer, argparse  
 - **LLM Integration**: OpenAI or Hugging Face  
-
 ---
 
 ## Installation  
 
 ```bash
-git clone https://github.com/yourusername/octo.git
-cd octo
 pip install -r requirements.txt
+pip install .
 ```
 
 
 ---
-# Start the CLI
-python octo.py
+## Start the CLI
+![WhatsApp Image 2025-03-22 at 05 23 34_7a94d29e](https://github.com/user-attachments/assets/b7f489ee-0c47-43ef-ada1-8e0166fb7091)
 
-# Example: Provide an issue URL
-octo --issue-link https://github.com/username/repo/issues/42
+## Commands
+![WhatsApp Image 2025-03-22 at 05 22 15_ba01756d](https://github.com/user-attachments/assets/135b4a9b-4abb-46d1-b510-c01f0127ff08)
 
-# Example: Provide repo and issue number
-octo --repo username/repo --issue-number 42
-
-# Start asking questions about the repo or issue!
 ---
-
